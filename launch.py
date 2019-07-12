@@ -1,18 +1,18 @@
+from copy import copy
 import numpy as np
 from itertools import product
-from copy import copy
-from tools import SIMULATORS, MAX_JOBS_PER_ONE, BACKENDS, chunks
-
 
 from qiskit import execute, QuantumCircuit
 from qiskit.tools.monitor import job_monitor
-from qiskit.tools.qcvv.tomography import fit_tomography_data, tomography_set
-from qiskit.tools.qcvv.tomography import tomography_data, create_tomography_circuits
+from qiskit.ignis.verification.tomography import StateTomographyFitter
+from qiskit.ignis.verification.tomography import state_tomography_circuits
+
+from tools import MAX_JOBS_PER_ONE, SIMULATORS, BACKENDS, chunks
 
 
 def sort_list_and_transformation_matrix(a):
     """
-    This is to sorts qubit. Also, it returns S matrix for changed density matrix
+    There is to sorts qubit. Also, it returns S matrix for changed density matrix
     :param a: list
     :return: (list, np.array(2**len(a), 2**len(a)))
     """
@@ -25,6 +25,7 @@ def sort_list_and_transformation_matrix(a):
             if b[j] > b[j+1]:
                 b[j], b[j+1] = b[j+1], b[j]
 
+                # TODO It's slow. Change it, please
                 step_matrix = np.eye(2**length, 2**length)
                 for digits in product([0, 1], repeat=length):
                     if digits[j] == digits[j+1]:
@@ -50,8 +51,10 @@ def sort_list_and_transformation_matrix(a):
 
 
 class Launcher:
-    def __init__(self, backend_name='ibmq_16_melbourne', shots=8192):
+    def __init__(self, token=None, backend_name='ibmq_16_melbourne',
+                 shots=8192):
         self.shots = shots
+        self.token = token
 
         self.backend = next(filter(lambda x: x.name() == backend_name, BACKENDS))
 
@@ -75,14 +78,14 @@ class Launcher:
             circuits = [circuits]
 
         meas_qubits, s_matrix = sort_list_and_transformation_matrix(meas_qubits)
-
-        tomo_set = tomography_set(meas_qubits)
         number_measure_experiments = 3**len(meas_qubits)
 
         jobs = []
         for qc in circuits:
-            q, c = qc.qregs[0], qc.cregs[0]
-            tomo_circuits = create_tomography_circuits(qc, q, c, tomo_set)
+            qr = qc.qregs[0]
+            tomo_circuits = state_tomography_circuits(
+                qc, [qr[qubit_number] for qubit_number in meas_qubits]
+            )
             jobs.extend(tomo_circuits)
 
         res = None
@@ -90,16 +93,14 @@ class Launcher:
             if count_chunks:
                 print(f'chunk number: {i + 1}')
             execute_kwargs = {
-                'circuits': chunk_jobs,
+                'experiments': chunk_jobs,
                 'backend': self.backend,
                 'shots': self.shots,
                 'max_credits': 15
             }
 
-            job_exp = execute(**execute_kwargs)
-            job_monitor(job_exp)
-            new_res = job_exp.result()
-
+            new_res = execute(**execute_kwargs).result()
+            
             if res is None:
                 res = new_res
             else:
@@ -111,9 +112,11 @@ class Launcher:
             res_matrix.results = res.results[
                 i*number_measure_experiments:(i + 1)*number_measure_experiments
             ]
-            tomo_data = tomography_data(
-                res_matrix, circuits[i].name, tomo_set
-            )
-            rho = np.linalg.inv(s_matrix)@fit_tomography_data(tomo_data)@s_matrix
+
+            rho = StateTomographyFitter(
+                res_matrix,
+                jobs[i*number_measure_experiments:(i + 1)*number_measure_experiments]
+            ).fit()
+            rho = np.linalg.inv(s_matrix) @ rho @ s_matrix
             matrices.append(rho)
         return matrices
